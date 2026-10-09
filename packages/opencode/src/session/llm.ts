@@ -44,6 +44,7 @@ export type StreamInput = {
   small?: boolean
   tools: Record<string, Tool>
   retries?: number
+  fallbackModels?: Provider.Model[]
   toolChoice?: "auto" | "required" | "none"
 }
 
