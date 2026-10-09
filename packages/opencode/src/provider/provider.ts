@@ -1247,6 +1247,7 @@ export interface Interface {
   readonly list: () => Effect.Effect<Record<ProviderV2.ID, Info>>
   readonly getProvider: (providerID: ProviderV2.ID) => Effect.Effect<Info>
   readonly getModel: (providerID: ProviderV2.ID, modelID: ModelV2.ID) => Effect.Effect<Model, ModelNotFoundError>
+  readonly fallbackModels: (model: Model) => Effect.Effect<Model[]>
   readonly getLanguage: (model: Model) => Effect.Effect<LanguageModelV3, ModelNotFoundError>
   readonly closest: (
     providerID: ProviderV2.ID,
@@ -1946,6 +1947,21 @@ const layer = Layer.effect(
       )
     })
 
+    const fallbackModels = Effect.fn("Provider.fallbackModels")(function* (model: Model) {
+      const configured = model.options.fallback_models
+      if (!Array.isArray(configured) || !configured.every((item) => typeof item === "string")) return []
+
+      const result: Model[] = []
+      for (const reference of configured) {
+        const { providerID, modelID } = parseModel(reference)
+        const fallback = yield* getModel(providerID, modelID).pipe(
+          Effect.catchTag("ProviderModelNotFoundError", () => Effect.succeed(undefined)),
+        )
+        if (fallback) result.push(fallback)
+      }
+      return result
+    })
+
     const closest = Effect.fn("Provider.closest")(function* (providerID: ProviderV2.ID, query: string[]) {
       const s = yield* InstanceState.get(state)
       const provider = s.providers[providerID]
@@ -2062,7 +2078,16 @@ const layer = Layer.effect(
       }
     })
 
-    return Service.of({ list, getProvider, getModel, getLanguage, closest, getSmallModel, defaultModel })
+    return Service.of({
+      list,
+      getProvider,
+      getModel,
+      fallbackModels,
+      getLanguage,
+      closest,
+      getSmallModel,
+      defaultModel,
+    })
   }),
 )
 

@@ -455,6 +455,54 @@ it.instance(
 )
 
 it.instance(
+  "resolves ordered fallback models and ignores missing references",
+  Effect.gen(function* () {
+    const primary = yield* Provider.use.getModel(ProviderV2.ID.make("fallback-provider"), ModelV2.ID.make("primary"))
+    const fallbacks = yield* Provider.use.fallbackModels(primary)
+    expect(fallbacks.map((model) => `${model.providerID}/${model.id}`)).toEqual(["fallback-provider/secondary"])
+  }),
+  {
+    config: {
+      provider: {
+        "fallback-provider": {
+          npm: "@ai-sdk/openai-compatible",
+          api: "https://api.example.com/v1",
+          env: [],
+          models: {
+            primary: {
+              options: {
+                fallback_models: ["fallback-provider/missing", "fallback-provider/secondary"],
+              },
+            },
+            secondary: {},
+          },
+        },
+      },
+    },
+  },
+)
+
+it.instance(
+  "ignores malformed fallback model options",
+  Effect.gen(function* () {
+    const primary = yield* Provider.use.getModel(ProviderV2.ID.make("fallback-provider"), ModelV2.ID.make("primary"))
+    expect(yield* Provider.use.fallbackModels({ ...primary, options: { fallback_models: "not-an-array" } })).toEqual([])
+  }),
+  {
+    config: {
+      provider: {
+        "fallback-provider": {
+          npm: "@ai-sdk/openai-compatible",
+          api: "https://api.example.com/v1",
+          env: [],
+          models: { primary: {} },
+        },
+      },
+    },
+  },
+)
+
+it.instance(
   "provider removed when all models filtered out",
   Effect.gen(function* () {
     const providers = yield* list

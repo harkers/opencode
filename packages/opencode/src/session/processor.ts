@@ -113,10 +113,11 @@ const layer = Layer.effect(
         reasoningMap: {},
       }
       let aborted = false
+      let producedOutput = false
 
-      const parse = (e: unknown) =>
+      const parse = (e: unknown, model = ctx.model) =>
         MessageV2.fromError(e, {
-          providerID: input.model.providerID,
+          providerID: model.providerID,
           aborted,
         })
 
@@ -276,6 +277,18 @@ const layer = Layer.effect(
       }
 
       const handleEvent = Effect.fnUntraced(function* (value: StreamEvent) {
+        if (
+          value.type === "reasoning-start" ||
+          value.type === "reasoning-delta" ||
+          value.type === "tool-input-start" ||
+          value.type === "tool-input-delta" ||
+          value.type === "tool-input-end" ||
+          value.type === "tool-call" ||
+          value.type === "text-start" ||
+          value.type === "text-delta"
+        ) {
+          producedOutput = true
+        }
         switch (value.type) {
           case "reasoning-start":
             if (value.id in ctx.reasoningMap) return
@@ -647,53 +660,77 @@ const layer = Layer.effect(
         ctx.shouldBreak = (yield* config.get()).experimental?.continue_loop_on_deny !== true
 
         return yield* Effect.gen(function* () {
-          yield* Effect.gen(function* () {
-            ctx.currentText = undefined
-            ctx.reasoningMap = {}
-            yield* status.set(ctx.sessionID, { type: "busy" })
-            const stream = llm.stream(streamInput)
+          const models = [streamInput.model, ...(streamInput.fallbackModels ?? [])]
+          let modelIndex = 0
 
-            yield* stream.pipe(
-              Stream.tap((event) => handleEvent(event)),
-              Stream.takeUntil(() => ctx.needsCompaction),
-              Stream.runDrain,
-            )
-          }).pipe(
-            Effect.onInterrupt(() =>
-              Effect.gen(function* () {
-                aborted = true
-                if (!ctx.assistantMessage.error) {
-                  yield* halt(new DOMException("Aborted", "AbortError"))
-                }
-              }),
-            ),
-            Effect.catchCauseIf(
-              (cause) => !Cause.hasInterruptsOnly(cause),
-              (cause) => Effect.fail(Cause.squash(cause)),
-            ),
-            Effect.retry(
-              SessionRetry.policy({
-                provider: input.model.providerID,
-                parse,
-                set: (info) => {
-                  return status.set(ctx.sessionID, {
-                    type: "retry",
-                    attempt: info.attempt,
-                    message: info.message,
-                    action: info.action,
-                    next: info.next,
-                  })
-                },
-              }),
-            ),
-            Effect.catch(halt),
-            Effect.ensuring(cleanup()),
-          )
+          while (modelIndex < models.length) {
+            const model = models[modelIndex]
+            ctx.model = model
+            const result = yield* Effect.gen(function* () {
+              ctx.currentText = undefined
+              ctx.reasoningMap = {}
+              yield* status.set(ctx.sessionID, { type: "busy" })
+              const stream = llm.stream({ ...streamInput, model, fallbackModels: undefined })
+
+              yield* stream.pipe(
+                Stream.tap((event) => handleEvent(event)),
+                Stream.takeUntil(() => ctx.needsCompaction),
+                Stream.runDrain,
+              )
+            })
+              .pipe(
+                Effect.onInterrupt(() =>
+                  Effect.gen(function* () {
+                    aborted = true
+                    if (!ctx.assistantMessage.error) {
+                      yield* halt(new DOMException("Aborted", "AbortError"))
+                    }
+                  }),
+                ),
+                Effect.catchCauseIf(
+                  (cause) => !Cause.hasInterruptsOnly(cause),
+                  (cause) => Effect.fail(Cause.squash(cause)),
+                ),
+                Effect.retry(
+                  SessionRetry.policy({
+                    provider: model.providerID,
+                    parse: (error) => parse(error, model),
+                    set: (info) => {
+                      return status.set(ctx.sessionID, {
+                        type: "retry",
+                        attempt: info.attempt,
+                        message: info.message,
+                        action: info.action,
+                        next: info.next,
+                      })
+                    },
+                  }),
+                ),
+              )
+              .pipe(
+                Effect.map(() => ({ ok: true as const })),
+                Effect.catch((error) => Effect.succeed({ ok: false as const, error })),
+              )
+
+            if (result.ok) break
+
+            const error = result.error
+            const canFallback =
+              modelIndex + 1 < models.length &&
+              !producedOutput &&
+              SessionRetry.retryable(parse(error, model), model.providerID) !== undefined
+            if (!canFallback) {
+              yield* halt(error)
+              break
+            }
+            modelIndex += 1
+            producedOutput = false
+          }
 
           if (ctx.needsCompaction) return "compact"
           if (ctx.blocked || ctx.assistantMessage.error) return "stop"
           return "continue"
-        })
+        }).pipe(Effect.ensuring(cleanup()))
       })
 
       return {

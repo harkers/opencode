@@ -3,7 +3,7 @@ import { Database } from "@opencode-ai/core/database/database"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { EventV2Bridge } from "@/event-v2-bridge"
 import { expect } from "bun:test"
-import { tool } from "ai"
+import { APICallError, tool } from "ai"
 import { Cause, Effect, Exit, Fiber, Layer, Stream } from "effect"
 import path from "path"
 import z from "zod"
@@ -16,6 +16,7 @@ import { MessageV2 } from "../../src/session/message-v2"
 import { SessionProcessor } from "../../src/session/processor"
 import { MessageID, PartID, SessionID } from "../../src/session/schema"
 import { SessionStatus } from "../../src/session/status"
+import { SessionRetry } from "../../src/session/retry"
 import { SessionSummary } from "../../src/session/summary"
 import { CrossSpawnSpawner } from "@opencode-ai/core/cross-spawn-spawner"
 import { provideTmpdirInstance, provideTmpdirServer } from "../fixture/fixture"
@@ -26,6 +27,7 @@ import { ProviderV2 } from "@opencode-ai/core/provider"
 import { ModelV2 } from "@opencode-ai/core/model"
 import { SessionProjector } from "@opencode-ai/core/session/projector"
 import { LLMEvent } from "@opencode-ai/llm"
+import { ProviderTest } from "../fake/provider"
 
 const summary = Layer.succeed(
   SessionSummary.Service,
@@ -226,6 +228,50 @@ const fragmentFailureLLM = Layer.succeed(
 const fragmentFailureEnv = LayerNode.compile(root, [...replacements, [LLM.node, fragmentFailureLLM]])
 const itFragmentFailure = testEffect(fragmentFailureEnv)
 
+const fallbackCalls: string[] = []
+let partialFailure = false
+let nonRetryableFailure = false
+const fallbackLLM = Layer.succeed(
+  LLM.Service,
+  LLM.Service.of({
+    stream: (input) => {
+      fallbackCalls.push(String(input.model.id))
+      if (input.model.id === "test-model") {
+        const error = new APICallError({
+          message: "capacity exceeded",
+          url: "https://example.com/v1/chat/completions",
+          requestBodyValues: {},
+          statusCode: nonRetryableFailure ? 401 : 503,
+          responseHeaders: { "retry-after-ms": "0" },
+          responseBody: "capacity exceeded",
+          isRetryable: !nonRetryableFailure,
+        })
+        if (!partialFailure) return Stream.fail(error)
+        return Stream.concat(
+          Stream.make(
+            LLMEvent.textStart({ id: "partial-text" }),
+            LLMEvent.textDelta({ id: "partial-text", text: "partial" }),
+          ),
+          Stream.fail(error),
+        )
+      }
+      return Stream.make(
+        LLMEvent.stepStart({ index: 0 }),
+        LLMEvent.textStart({ id: "fallback-text" }),
+        LLMEvent.textDelta({ id: "fallback-text", text: "fallback" }),
+        LLMEvent.textEnd({ id: "fallback-text" }),
+        LLMEvent.stepFinish({ index: 0, reason: "stop" }),
+        LLMEvent.finish({ reason: "stop" }),
+      )
+    },
+  }),
+)
+const fallbackEnv = LayerNode.compile(
+  LayerNode.group([root, LayerNode.make({ service: TestLLMServer, layer: TestLLMServer.layer, deps: [] })]),
+  [...replacements, [LLM.node, fallbackLLM]],
+)
+const itFallback = testEffect(fallbackEnv)
+
 const boot = Effect.fn("test.boot")(function* () {
   const processors = yield* SessionProcessor.Service
   const session = yield* Session.Service
@@ -280,6 +326,107 @@ it.live("session.processor effect tests capture llm input cleanly", () =>
         expect(value).toBe("continue")
         expect(calls).toBe(1)
         expect(parts.some((part) => part.type === "text" && part.text === "hello")).toBe(true)
+      }),
+    { config: (url) => providerCfg(url) },
+  ),
+)
+
+itFallback.live("session.processor switches to the first fallback after capacity retries", () =>
+  provideTmpdirServer(
+    ({ dir }) =>
+      Effect.gen(function* () {
+        fallbackCalls.length = 0
+        partialFailure = false
+        const { processors, session, provider } = yield* boot()
+        const chat = yield* session.create({})
+        const parent = yield* user(chat.id, "hi")
+        const msg = yield* assistant(chat.id, parent.id, path.resolve(dir))
+        const primary = yield* provider.getModel(ref.providerID, ref.modelID)
+        const fallback = ProviderTest.model({ id: ModelV2.ID.make("fallback-model"), providerID: ref.providerID })
+        const handle = yield* processors.create({ assistantMessage: msg, sessionID: chat.id, model: primary })
+
+        const result = yield* handle.process({
+          user: parent,
+          sessionID: chat.id,
+          model: primary,
+          fallbackModels: [fallback],
+          agent: agent(),
+          system: [],
+          messages: [{ role: "user", content: "hi" }],
+          tools: {},
+        })
+
+        expect(result).toBe("continue")
+        expect(fallbackCalls).toEqual([
+          ...Array(SessionRetry.RETRY_MAX_RETRIES + 1).fill("test-model"),
+          "fallback-model",
+        ])
+      }),
+    { config: (url) => providerCfg(url) },
+  ),
+)
+
+itFallback.live("session.processor does not fallback after output starts", () =>
+  provideTmpdirServer(
+    ({ dir }) =>
+      Effect.gen(function* () {
+        fallbackCalls.length = 0
+        partialFailure = true
+        nonRetryableFailure = false
+        const { processors, session, provider } = yield* boot()
+        const chat = yield* session.create({})
+        const parent = yield* user(chat.id, "hi")
+        const msg = yield* assistant(chat.id, parent.id, path.resolve(dir))
+        const primary = yield* provider.getModel(ref.providerID, ref.modelID)
+        const fallback = ProviderTest.model({ id: ModelV2.ID.make("fallback-model"), providerID: ref.providerID })
+        const handle = yield* processors.create({ assistantMessage: msg, sessionID: chat.id, model: primary })
+
+        const result = yield* handle.process({
+          user: parent,
+          sessionID: chat.id,
+          model: primary,
+          fallbackModels: [fallback],
+          agent: agent(),
+          system: [],
+          messages: [{ role: "user", content: "hi" }],
+          tools: {},
+        })
+
+        expect(result).toBe("stop")
+        expect(fallbackCalls.every((model) => model === "test-model")).toBe(true)
+      }),
+    { config: (url) => providerCfg(url) },
+  ),
+)
+
+itFallback.live("session.processor does not fallback for non-retryable errors", () =>
+  provideTmpdirServer(
+    ({ dir }) =>
+      Effect.gen(function* () {
+        fallbackCalls.length = 0
+        partialFailure = false
+        nonRetryableFailure = true
+        const { processors, session, provider } = yield* boot()
+        const chat = yield* session.create({})
+        const parent = yield* user(chat.id, "hi")
+        const msg = yield* assistant(chat.id, parent.id, path.resolve(dir))
+        const primary = yield* provider.getModel(ref.providerID, ref.modelID)
+        const fallback = ProviderTest.model({ id: ModelV2.ID.make("fallback-model"), providerID: ref.providerID })
+        const handle = yield* processors.create({ assistantMessage: msg, sessionID: chat.id, model: primary })
+
+        const result = yield* handle.process({
+          user: parent,
+          sessionID: chat.id,
+          model: primary,
+          fallbackModels: [fallback],
+          agent: agent(),
+          system: [],
+          messages: [{ role: "user", content: "hi" }],
+          tools: {},
+        })
+
+        expect(result).toBe("stop")
+        expect(fallbackCalls).toEqual(["test-model"])
       }),
     { config: (url) => providerCfg(url) },
   ),

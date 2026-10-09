@@ -1282,6 +1282,7 @@ const layer = Layer.effect(
               ],
               tools,
               model,
+              fallbackModels: yield* provider.fallbackModels(model),
               toolChoice: format.type === "json_schema" ? "required" : undefined,
             })
 
